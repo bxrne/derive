@@ -1,0 +1,252 @@
+//! Write-ahead log: append-only binary journal. Records are self-contained UTF-8 strings for replay.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const File = Io.File;
+const rdf = @import("../rdf.zig");
+const Quad = rdf.Quad;
+const Term = rdf.Term;
+const StringPool = @import("string_pool.zig").StringPool;
+
+pub const magic: *const [4]u8 = "DERW";
+pub const format_version: u8 = 0;
+
+pub const RecordKind = enum(u8) {
+    commit = 0,
+    add_quad = 0x21,
+    remove_quad = 0x23,
+};
+
+pub const WalError = error{
+    InvalidMagic,
+    UnsupportedVersion,
+    TruncatedRecord,
+    BadPayload,
+} || File.WritePositionalError || File.SyncError || File.LengthError || File.StatError || Allocator.Error;
+
+/// Read exactly `buf.len` bytes from the reader.
+/// Returns `error.TruncatedRecord` on EOF or failure.
+fn readSliceAllWalBuf(r: *Io.Reader, buf: []u8) WalError!void {
+    Io.Reader.readSliceAll(r, buf) catch |err| switch (err) {
+        error.EndOfStream => return error.TruncatedRecord,
+        error.ReadFailed => return error.TruncatedRecord,
+    };
+}
+
+/// Write a little-endian 32-bit integer to the buffer.
+fn writeU32Le(gpa: Allocator, buf: *std.ArrayList(u8), v: u32) Allocator.Error!void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try buf.appendSlice(gpa, b[0..]);
+}
+
+/// Read a little-endian 32-bit integer from the reader.
+pub fn readU32Le(r: *Io.Reader) WalError!u32 {
+    var b: [4]u8 = undefined;
+    try readSliceAllWalBuf(r, &b);
+    return std.mem.readInt(u32, &b, .little);
+}
+
+/// Write a string prefixed by its length (as a 32-bit little-endian integer).
+fn writeStr(gpa: Allocator, buf: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
+    if (s.len > std.math.maxInt(u32)) return error.OutOfMemory;
+    try writeU32Le(gpa, buf, @intCast(s.len));
+    try buf.appendSlice(gpa, s);
+}
+
+/// Read a string prefixed by its length (as a 32-bit little-endian integer).
+/// The caller owns the returned slice and must free it with `allocator`.
+pub fn readStr(allocator: Allocator, r: *Io.Reader) (Allocator.Error || WalError)![]const u8 {
+    const len = try readU32Le(r);
+    if (len == 0) return "";
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+    try readSliceAllWalBuf(r, out);
+    return out;
+}
+
+/// Encode a term into the buffer.
+/// `iri` is 0, `blank_node` is 1, `literal` is 2.
+fn encodeTerm(gpa: Allocator, buf: *std.ArrayList(u8), pool: *const StringPool, term: Term) Allocator.Error!void {
+    switch (term) {
+        .iri => |h| {
+            try buf.append(gpa, 0);
+            try writeStr(gpa, buf, pool.get(h));
+        },
+        .blank_node => |h| {
+            try buf.append(gpa, 1);
+            try writeStr(gpa, buf, pool.get(h));
+        },
+        .literal => |lit| {
+            try buf.append(gpa, 2);
+            try writeStr(gpa, buf, pool.get(lit.value));
+            if (lit.datatype) |dt| {
+                try buf.append(gpa, 1);
+                try writeStr(gpa, buf, pool.get(dt));
+            } else {
+                try buf.append(gpa, 0);
+            }
+            if (lit.lang) |l| {
+                try buf.append(gpa, 1);
+                try writeStr(gpa, buf, pool.get(l));
+            } else {
+                try buf.append(gpa, 0);
+            }
+        },
+    }
+}
+
+/// Encode a quad into the buffer (subject, predicate, object, graph).
+fn encodeQuadPayload(gpa: Allocator, buf: *std.ArrayList(u8), pool: *const StringPool, quad: Quad) Allocator.Error!void {
+    try encodeTerm(gpa, buf, pool, quad.subject);
+    try writeStr(gpa, buf, pool.get(quad.predicate));
+    try encodeTerm(gpa, buf, pool, quad.object);
+    try writeStr(gpa, buf, pool.get(quad.graph));
+}
+
+/// Append a quad record to the WAL.
+pub fn appendQuadRecord(
+    io: Io,
+    file: *File,
+    gpa: Allocator,
+    scratch: *std.ArrayList(u8),
+    pool: *const StringPool,
+    quad: Quad,
+    kind: RecordKind,
+    crc: *std.hash.Crc32,
+) WalError!void {
+    scratch.clearRetainingCapacity();
+    try encodeQuadPayload(gpa, scratch, pool, quad);
+    var off = try file.length(io);
+    const kind_byte = @intFromEnum(kind);
+    try file.writePositionalAll(io, &.{kind_byte}, off);
+    crc.update(&.{kind_byte});
+    off += 1;
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(scratch.items.len), .little);
+    try file.writePositionalAll(io, &len_buf, off);
+    crc.update(&len_buf);
+    off += 4;
+    try file.writePositionalAll(io, scratch.items, off);
+    crc.update(scratch.items);
+    off += scratch.items.len;
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
+    try file.writePositionalAll(io, &crc_buf, off);
+}
+
+/// Append a commit record to the WAL.
+pub fn appendCommit(io: Io, file: *File, crc: *std.hash.Crc32) WalError!void {
+    var off = try file.length(io);
+    const kind_byte = @intFromEnum(RecordKind.commit);
+    try file.writePositionalAll(io, &.{kind_byte}, off);
+    crc.update(&.{kind_byte});
+    off += 1;
+    const zero: [4]u8 = .{ 0, 0, 0, 0 };
+    try file.writePositionalAll(io, &zero, off);
+    crc.update(&zero);
+    off += 4;
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
+    try file.writePositionalAll(io, &crc_buf, off);
+}
+
+/// Sync the file to disk.
+pub fn syncFile(io: Io, file: *File) WalError!void {
+    try file.sync(io);
+}
+
+/// Write the WAL header (magic and format version).
+pub fn writeHeader(io: Io, file: *File, seed: u32) WalError!void {
+    try file.writePositionalAll(io, magic, 0);
+    try file.writePositionalAll(io, &.{format_version}, 4);
+    var seed_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seed_buf, seed, .little);
+    try file.writePositionalAll(io, &seed_buf, 5);
+}
+
+/// Read and verify the WAL header. Returns the checksum seed.
+pub fn readAndVerifyHeader(r: *Io.Reader) WalError!u32 {
+    var m: [4]u8 = undefined;
+    readSliceAllWalBuf(r, &m) catch return error.InvalidMagic;
+    if (!std.mem.eql(u8, &m, magic)) return error.InvalidMagic;
+    var ver: [1]u8 = undefined;
+    try readSliceAllWalBuf(r, &ver);
+    if (ver[0] != format_version) return error.UnsupportedVersion;
+    return try readU32Le(r);
+}
+
+/// Read a term input from the reader.
+pub fn readTermInput(allocator: Allocator, r: *Io.Reader) (Allocator.Error || WalError)!rdf.Input {
+    var tag_buf: [1]u8 = undefined;
+    try readSliceAllWalBuf(r, &tag_buf);
+    return switch (tag_buf[0]) {
+        0 => .{ .iri = try readStr(allocator, r) },
+        1 => .{ .blank_node = try readStr(allocator, r) },
+        2 => blk: {
+            const val = try readStr(allocator, r);
+            errdefer allocator.free(val);
+            var dt_flag: [1]u8 = undefined;
+            try readSliceAllWalBuf(r, &dt_flag);
+            var dt: ?[]const u8 = null;
+            if (dt_flag[0] != 0) {
+                dt = try readStr(allocator, r);
+            }
+            var lang_flag: [1]u8 = undefined;
+            try readSliceAllWalBuf(r, &lang_flag);
+            var lang: ?[]const u8 = null;
+            if (lang_flag[0] != 0) {
+                lang = try readStr(allocator, r);
+            }
+            break :blk .{ .literal = .{
+                .value = val,
+                .datatype = dt,
+                .lang = lang,
+            } };
+        },
+        else => error.BadPayload,
+    };
+}
+
+/// Free memory allocated for a term input.
+pub fn freeInput(allocator: Allocator, input: rdf.Input) void {
+    switch (input) {
+        .iri => |s| allocator.free(s),
+        .blank_node => |s| allocator.free(s),
+        .literal => |lit| {
+            allocator.free(lit.value);
+            if (lit.datatype) |d| allocator.free(d);
+            if (lit.lang) |l| allocator.free(l);
+        },
+    }
+}
+
+/// Decoded payload for a quad addition or removal.
+pub const DecodedQuadPayload = struct {
+    subject: rdf.Input,
+    predicate: []const u8,
+    object: rdf.Input,
+    graph: []const u8,
+};
+
+/// Decode a quad payload from a buffer.
+pub fn decodeAddOrRemovePayload(allocator: Allocator, payload: []const u8) (Allocator.Error || WalError)!DecodedQuadPayload {
+    var r = Io.Reader.fixed(payload);
+    const subject = try readTermInput(allocator, &r);
+    errdefer freeInput(allocator, subject);
+    const predicate = try readStr(allocator, &r);
+    errdefer allocator.free(predicate);
+    const object = try readTermInput(allocator, &r);
+    errdefer freeInput(allocator, object);
+    const graph = try readStr(allocator, &r);
+    return .{ .subject = subject, .predicate = predicate, .object = object, .graph = graph };
+}
+
+/// Free memory allocated for a decoded quad payload.
+pub fn freeDecodedQuadPayload(allocator: Allocator, decoded: DecodedQuadPayload) void {
+    freeInput(allocator, decoded.subject);
+    allocator.free(decoded.predicate);
+    freeInput(allocator, decoded.object);
+    allocator.free(decoded.graph);
+}
