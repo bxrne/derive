@@ -15,6 +15,22 @@ The codebase follows [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blo
 
 ---
 
+### Design update: indexed permutation model
+
+The store uses an **indexed permutation model** for RDF quads. Each quad is encoded as four `u32` handles in SPOG order and stored in multiple lexicographically sorted permutations (`spog`, `posg`, `ospg`, `gspo`, `gpos`, `gosp`). Pattern matching chooses the permutation with the longest bound prefix, then performs a contiguous range scan over that prefix. This yields efficient ordered scans for basic graph patterns without needing a join planner.
+
+**Why this choice**
+- **Read locality:** prefix scans over a sorted run are cache-friendly and support range queries directly.
+- **Match planning:** the longest-prefix heuristic is simple and deterministic, yet captures most practical patterns.
+- **Flexibility:** alternative backings can provide the same ordered scan interface with different write costs.
+
+**Trade-offs**
+- **Write amplification:** each insert updates six permutations; contiguous stores pay shift costs.
+- **Memory overhead:** storing multiple orderings increases index footprint.
+- **Backings matter:** write-heavy workloads benefit from tree-backed permutations; scan-heavy workloads benefit from contiguous storage.
+
+---
+
 ## Proof of concept
 
 The proof of concept stores RDF 1.1 style quads (subject, predicate, object, named graph) in memory with matching over basic graph patterns. The implementation combines a deduplicated quad store, a string pool for interned text, six lexicographically sorted key runs (one per index permutation), optional single-pattern matching over those indexes, and an append-only journal for durability experiments. It is not a full SPARQL engine, optimizer, or distributed store.
@@ -33,7 +49,12 @@ The storage layer (`storage/mod.zig`) owns `Core`, which bundles a `StringPool`,
 
 ### Indexing structure
 
-The index is six independent `MemoryStore` instances, one per permutation of `(g, s, p, o)` encoded as four `u32` components in a fixed order for that permutation: `spog`, `posg`, `ospg`, `gspo`, `gpos`, and `gosp`. Each store keeps all its keys in lexicographic order in a contiguous list. Insertion finds the position with binary search, skips duplicates, and shifts tail elements to make room, so a single insert is linear in the size of that permutation's list in the worst case, not constant time. Lookup and prefix scans use lower and upper bound binary searches to return a contiguous slice of keys sharing a prefix. Adding or removing one quad updates all six stores so write cost scales with the sum of the six list sizes for the shift work, while read paths get a sorted range for any prefix that aligns with one of the six orderings.
+The index is six independent permutation stores, one per ordering of `(g, s, p, o)` encoded as four `u32` components in a fixed order for that permutation: `spog`, `posg`, `ospg`, `gspo`, `gpos`, and `gosp`. The backing is selected at init time (`IndexBacking`) and determines how each permutation stores its ordered keys.
+
+- **ContiguousStore:** keys are kept in a single lexicographically sorted list. Inserts binary-search for position, skip duplicates, and shift tail elements. This is cache-friendly for scans but write cost is linear in the list length.
+- **TreeStore:** keys are stored in a treap with lexicographic ordering. Inserts and deletes are logarithmic in size, and scans iterate in-order from a lower bound. This reduces write amplification at the cost of pointer-chasing during scans.
+
+Both backings expose the same ordered-scan interface (`KeyScan`) so match planning and iterators do not depend on the physical layout. Adding or removing one quad updates all six permutations so total write cost still scales with six index updates.
 
 ### Matching and iterators
 

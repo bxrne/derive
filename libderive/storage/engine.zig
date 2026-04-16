@@ -12,6 +12,7 @@ const rdf = @import("../rdf.zig");
 const Quad = rdf.Quad;
 const Handle = rdf.Handle;
 const Index = @import("../index.zig").Index;
+const IndexBacking = @import("../index.zig").IndexBacking;
 
 pub const StringPool = @import("string_pool.zig").StringPool;
 
@@ -127,11 +128,11 @@ pub const Core = struct {
     store: QuadStore,
     index: Index,
 
-    pub fn init(allocator: Allocator) Allocator.Error!Core {
+    pub fn init(allocator: Allocator, index_backing: IndexBacking) Allocator.Error!Core {
         return .{
             .strings = StringPool.init(allocator),
             .store = QuadStore.init(),
-            .index = Index.init(allocator),
+            .index = Index.init(allocator, index_backing),
         };
     }
 

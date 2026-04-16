@@ -18,6 +18,20 @@ pub const RecordKind = enum(u8) {
     remove_quad = 0x23,
 };
 
+/// How to open the dataset: pure in-memory, or durable append-only journal.
+pub const WalMode = union(enum) {
+    memory,
+    journal: []const u8,
+};
+
+/// Open WAL file handle and encode scratch buffer when journaling is active.
+pub const WalBundle = struct {
+    io: Io,
+    file: Io.File,
+    scratch: std.ArrayList(u8),
+    crc: std.hash.Crc32,
+};
+
 pub const WalError = error{
     InvalidMagic,
     UnsupportedVersion,
@@ -249,4 +263,77 @@ pub fn freeDecodedQuadPayload(allocator: Allocator, decoded: DecodedQuadPayload)
     allocator.free(decoded.predicate);
     freeInput(allocator, decoded.object);
     allocator.free(decoded.graph);
+}
+
+/// Replay WAL records into a dataset-like target.
+pub fn replay(
+    comptime AddError: type,
+    comptime RemoveError: type,
+    allocator: Allocator,
+    reader: *Io.Reader,
+    seed: u32,
+    file: *Io.File,
+    io: Io,
+    target: anytype,
+    add_fn: fn (@TypeOf(target), rdf.Input, []const u8, rdf.Input, []const u8) AddError!void,
+    remove_fn: fn (@TypeOf(target), rdf.Input, []const u8, rdf.Input, []const u8) RemoveError!void,
+) (Allocator.Error || WalError || File.LengthError || AddError || RemoveError)!void {
+    var replay_crc = std.hash.Crc32.init();
+    var seed_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seed_buf, seed, .little);
+    replay_crc.update(&seed_buf);
+
+    // Keep track of the last valid record boundary to truncate if corruption occurs.
+    // 9 is magic(4) + version(1) + seed(4)
+    var last_valid_offset: u64 = 9;
+
+    while (true) {
+        var kind_buffer: [1]u8 = undefined;
+        const bytes_read = Io.Reader.readSliceShort(reader, &kind_buffer) catch break;
+        if (bytes_read == 0) break;
+        if (bytes_read != 1) break;
+
+        const payload_length = readU32Le(reader) catch break;
+
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, payload_length, .little);
+
+        const payload = allocator.alloc(u8, payload_length) catch return error.OutOfMemory;
+        defer allocator.free(payload);
+        Io.Reader.readSliceAll(reader, payload) catch break;
+
+        // Update cumulative checksum for kind, length, and payload
+        replay_crc.update(&kind_buffer);
+        replay_crc.update(&len_buf);
+        replay_crc.update(payload);
+
+        // Read the record's checksum
+        const expected_checksum = readU32Le(reader) catch break;
+
+        if (expected_checksum != replay_crc.final()) {
+            // Checksum mismatch, corrupted record. Stop replay.
+            break;
+        }
+
+        const kind: RecordKind = @enumFromInt(kind_buffer[0]);
+        switch (kind) {
+            .commit => {},
+            .add_quad => {
+                const decoded = decodeAddOrRemovePayload(allocator, payload) catch break;
+                defer freeDecodedQuadPayload(allocator, decoded);
+                try add_fn(target, decoded.subject, decoded.predicate, decoded.object, decoded.graph);
+            },
+            .remove_quad => {
+                const decoded = decodeAddOrRemovePayload(allocator, payload) catch break;
+                defer freeDecodedQuadPayload(allocator, decoded);
+                try remove_fn(target, decoded.subject, decoded.predicate, decoded.object, decoded.graph);
+            },
+        }
+
+        // Valid record parsed successfully. 1 byte kind + 4 byte len + payload + 4 byte checksum
+        last_valid_offset += 1 + 4 + payload_length + 4;
+    }
+
+    // Truncate the file to last_valid_offset to drop any corrupted/incomplete tail
+    file.setLength(io, last_valid_offset) catch {};
 }

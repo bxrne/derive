@@ -16,25 +16,15 @@ const spogKeyFromQuad = storage.spogKeyFromQuad;
 const LiveQuadIterator = storage.LiveQuadIterator;
 
 const query = @import("query.zig");
-const wal = @import("storage/wal.zig");
+const wal = storage;
 
 pub const AddStatementError = Allocator.Error || rdf.StatementBoundaryError || wal.WalError;
 
 pub const OpenError = Allocator.Error || wal.WalError || AddStatementError || Io.File.OpenError;
 
-/// How to open the dataset: pure in-memory, or durable append-only journal.
-pub const WalMode = union(enum) {
-    memory,
-    journal: []const u8,
-};
-
-/// Open WAL file handle and encode scratch buffer when journaling is active.
-pub const WalBundle = struct {
-    io: Io,
-    file: Io.File,
-    scratch: std.ArrayList(u8),
-    crc: std.hash.Crc32,
-};
+pub const WalMode = wal.WalMode;
+pub const WalBundle = wal.WalBundle;
+pub const IndexBacking = @import("index.zig").IndexBacking;
 
 pub const RDFDataset = struct {
     engine: Engine,
@@ -49,11 +39,16 @@ pub const RDFDataset = struct {
     /// Open a dataset. `.memory` — in RAM only. `.journal` — open/create
     /// path, replay existing records, then append new operations.
     pub fn init(init_process: std.process.Init, mode: WalMode) OpenError!RDFDataset {
+        return initWithBacking(init_process, mode, .contiguous);
+    }
+
+    /// Open a dataset with an explicit index backing.
+    pub fn initWithBacking(init_process: std.process.Init, mode: WalMode, index_backing: IndexBacking) OpenError!RDFDataset {
         const allocator = init_process.arena.allocator();
         const io = init_process.io;
 
         var dataset = RDFDataset{
-            .engine = .{ .memory = try Core.init(allocator) },
+            .engine = .{ .memory = try Core.init(allocator, index_backing) },
             .wal_bundle = null,
         };
         errdefer dataset.deinit();
@@ -117,64 +112,26 @@ pub const RDFDataset = struct {
     }
 
     fn replayWalRecords(self: *RDFDataset, allocator: Allocator, reader: *Io.Reader, seed: u32, file: *Io.File, io: Io) OpenError!void {
-        var replay_crc = std.hash.Crc32.init();
-        var seed_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &seed_buf, seed, .little);
-        replay_crc.update(&seed_buf);
+        try wal.replay(
+            AddStatementError,
+            AddStatementError,
+            allocator,
+            reader,
+            seed,
+            file,
+            io,
+            self,
+            replayAddQuad,
+            replayRemoveQuad,
+        );
+    }
 
-        // Keep track of the last valid record boundary to truncate if corruption occurs.
-        // 9 is magic(4) + version(1) + seed(4)
-        var last_valid_offset: u64 = 9;
+    fn replayAddQuad(self: *RDFDataset, subject: Input, predicate: []const u8, object: Input, graph: []const u8) AddStatementError!void {
+        try self.addQuad(subject, predicate, object, graph);
+    }
 
-        while (true) {
-            var kind_buffer: [1]u8 = undefined;
-            const bytes_read = Io.Reader.readSliceShort(reader, &kind_buffer) catch break;
-            if (bytes_read == 0) break;
-            if (bytes_read != 1) break;
-
-            const payload_length = wal.readU32Le(reader) catch break;
-            
-            var len_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len_buf, payload_length, .little);
-            
-            const payload = allocator.alloc(u8, payload_length) catch return error.OutOfMemory;
-            defer allocator.free(payload);
-            Io.Reader.readSliceAll(reader, payload) catch break;
-
-            // Update cumulative checksum for kind, length, and payload
-            replay_crc.update(&kind_buffer);
-            replay_crc.update(&len_buf);
-            replay_crc.update(payload);
-
-            // Read the record's checksum
-            const expected_checksum = wal.readU32Le(reader) catch break;
-            
-            if (expected_checksum != replay_crc.final()) {
-                // Checksum mismatch, corrupted record. Stop replay.
-                break;
-            }
-
-            const kind: wal.RecordKind = @enumFromInt(kind_buffer[0]);
-            switch (kind) {
-                .commit => {},
-                .add_quad => {
-                    const decoded = wal.decodeAddOrRemovePayload(allocator, payload) catch break;
-                    defer wal.freeDecodedQuadPayload(allocator, decoded);
-                    self.addQuad(decoded.subject, decoded.predicate, decoded.object, decoded.graph) catch return error.OutOfMemory;
-                },
-                .remove_quad => {
-                    const decoded = wal.decodeAddOrRemovePayload(allocator, payload) catch break;
-                    defer wal.freeDecodedQuadPayload(allocator, decoded);
-                    self.removeQuad(decoded.subject, decoded.predicate, decoded.object, decoded.graph) catch return error.OutOfMemory;
-                },
-            }
-
-            // Valid record parsed successfully. 1 byte kind + 4 byte len + payload + 4 byte checksum
-            last_valid_offset += 1 + 4 + payload_length + 4;
-        }
-
-        // Truncate the file to last_valid_offset to drop any corrupted/incomplete tail
-        file.setLength(io, last_valid_offset) catch {};
+    fn replayRemoveQuad(self: *RDFDataset, subject: Input, predicate: []const u8, object: Input, graph: []const u8) AddStatementError!void {
+        try self.removeQuad(subject, predicate, object, graph);
     }
 
     pub fn statementCount(self: *const RDFDataset) usize {

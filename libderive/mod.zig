@@ -19,6 +19,8 @@ pub const LiteralInput = rdf.LiteralInput;
 pub const StatementBoundaryError = rdf.StatementBoundaryError;
 pub const MatchIterator = dataset.RDFDataset.MatchIterator;
 
+pub const IndexBacking = dataset.RDFDataset.IndexBacking;
+
 pub const Quad = rdf.Quad;
 pub const Term = rdf.Term;
 pub const Handle = rdf.Handle;
