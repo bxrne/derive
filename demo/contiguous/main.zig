@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const wal_path = "derive-demo.wal";
 
-    var ds = try libderive.RDFDataset.initWithBacking(init, .{ .journal = wal_path }, .contiguous);
+    var ds = try libderive.RDFDataset.init(init, .{ .journal = wal_path }, .contiguous);
     defer ds.deinit();
 
     if (ds.statementCount() == 0) {

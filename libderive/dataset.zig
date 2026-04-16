@@ -38,12 +38,7 @@ pub const RDFDataset = struct {
 
     /// Open a dataset. `.memory` — in RAM only. `.journal` — open/create
     /// path, replay existing records, then append new operations.
-    pub fn init(init_process: std.process.Init, mode: WalMode) OpenError!RDFDataset {
-        return initWithBacking(init_process, mode, .contiguous);
-    }
-
-    /// Open a dataset with an explicit index backing.
-    pub fn initWithBacking(init_process: std.process.Init, mode: WalMode, index_backing: IndexBacking) OpenError!RDFDataset {
+    pub fn init(init_process: std.process.Init, mode: WalMode, index_backing: IndexBacking) OpenError!RDFDataset {
         const allocator = init_process.arena.allocator();
         const io = init_process.io;
 
