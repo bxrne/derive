@@ -8,6 +8,7 @@
 const std = @import("std");
 const rdf = @import("rdf.zig");
 const Index = @import("index.zig").Index;
+const KeyScan = @import("index.zig").KeyScan;
 const Permutation = @import("index.zig").Permutation;
 const Quad = rdf.Quad;
 const storage = @import("storage/mod.zig");
@@ -21,7 +22,7 @@ pub const Iterator = struct {
     store: *const QuadStore,
     mode: union(enum) {
         statements: void,
-        keys: struct { permutation: Permutation, keys: []const [4]u32 },
+        keys: struct { permutation: Permutation, scan: KeyScan },
     },
     subject: ?u32,
     predicate: ?u32,
@@ -43,10 +44,8 @@ pub const Iterator = struct {
                 }
                 return null;
             },
-            .keys => |mode| {
-                while (self.position < mode.keys.len) {
-                    const key = mode.keys[self.position];
-                    self.position += 1;
+            .keys => |*mode| {
+                while (mode.scan.next()) |key| {
                     const spog_key = decodeToSpog(mode.permutation, key);
                     const quad = self.store.quadCopyForSpogKey(spog_key) orelse continue;
                     if (matches(self, quad)) return quad;
@@ -199,7 +198,7 @@ pub fn build(store: *const QuadStore, index: *const Index, bound: BoundHandles) 
     const keys = index.scan(plan.permutation, plan.prefix[0..plan.prefix_length]);
     return .{
         .store = store,
-        .mode = .{ .keys = .{ .permutation = plan.permutation, .keys = keys } },
+        .mode = .{ .keys = .{ .permutation = plan.permutation, .scan = keys } },
         .subject = subject,
         .predicate = predicate,
         .object = object,

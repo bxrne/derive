@@ -29,9 +29,9 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&install_docs.step);
     b.installArtifact(libderive_lib);
 
-    // Demo executable
-    const demo_mod = b.createModule(.{
-        .root_source_file = b.path("demo/main.zig"),
+    // Demo executable: contiguous index
+    const demo_contiguous_mod = b.createModule(.{
+        .root_source_file = b.path("demo/contiguous/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -39,20 +39,45 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const demo_exe = b.addExecutable(.{
-        .name = "demo",
-        .root_module = demo_mod,
+    const demo_contiguous_exe = b.addExecutable(.{
+        .name = "demo-contiguous",
+        .root_module = demo_contiguous_mod,
     });
-    b.installArtifact(demo_exe);
+    b.installArtifact(demo_contiguous_exe);
 
-    const demo_run = b.addRunArtifact(demo_exe);
-    demo_run.step.dependOn(b.getInstallStep());
+    const demo_contiguous_run = b.addRunArtifact(demo_contiguous_exe);
+    demo_contiguous_run.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        demo_run.addArgs(args);
+        demo_contiguous_run.addArgs(args);
     }
 
-    const demo_step = b.step("demo", "Build and run the demo executable");
-    demo_step.dependOn(&demo_run.step);
+    const demo_contiguous_step = b.step("demo-contiguous", "Build and run the contiguous demo executable");
+    demo_contiguous_step.dependOn(&demo_contiguous_run.step);
+
+    // Demo executable: treap index
+    const demo_tree_mod = b.createModule(.{
+        .root_source_file = b.path("demo/tree/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "libderive", .module = libderive },
+        },
+    });
+
+    const demo_tree_exe = b.addExecutable(.{
+        .name = "demo-tree",
+        .root_module = demo_tree_mod,
+    });
+    b.installArtifact(demo_tree_exe);
+
+    const demo_tree_run = b.addRunArtifact(demo_tree_exe);
+    demo_tree_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        demo_tree_run.addArgs(args);
+    }
+
+    const demo_tree_step = b.step("demo-tree", "Build and run the treap demo executable");
+    demo_tree_step.dependOn(&demo_tree_run.step);
 
     // Tests for libderive, demo, and dst
     const libderive_tests = b.addTest(.{
@@ -60,12 +85,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_libderive_tests = b.addRunArtifact(libderive_tests);
 
-    const demo_tests = b.addTest(.{
-        .root_module = demo_mod,
+    const demo_contiguous_tests = b.addTest(.{
+        .root_module = demo_contiguous_mod,
     });
-    const run_demo_tests = b.addRunArtifact(demo_tests);
+    const run_demo_contiguous_tests = b.addRunArtifact(demo_contiguous_tests);
 
-    const test_step = b.step("test", "Run libderive, demo, and dst tests");
+    const demo_tree_tests = b.addTest(.{
+        .root_module = demo_tree_mod,
+    });
+    const run_demo_tree_tests = b.addRunArtifact(demo_tree_tests);
+
+    const test_step = b.step("test", "Run libderive and demo tests");
     test_step.dependOn(&run_libderive_tests.step);
-    test_step.dependOn(&run_demo_tests.step);
+    test_step.dependOn(&run_demo_contiguous_tests.step);
+    test_step.dependOn(&run_demo_tree_tests.step);
 }
