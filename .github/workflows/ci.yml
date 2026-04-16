@@ -24,8 +24,11 @@ jobs:
       - name: Run Tests
         run: zig build test
 
-      - name: Build Demo
-        run: zig build demo
+      - name: Build Contiguous Demo
+        run: zig build demo-contiguous
+
+      - name: Build Tree Demo
+        run: zig build demo-tree
 
       - name: Build Docs
         run: zig build docs
