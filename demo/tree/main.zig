@@ -12,7 +12,7 @@ const QuadTarget = 1_000_000;
 pub fn main(init: std.process.Init) !void {
     const wal_path = "derive-tree-demo.wal";
 
-    var ds = try libderive.RDFDataset.initWithBacking(init, .{ .journal = wal_path }, .tree);
+    var ds = try libderive.RDFDataset.init(init, .{ .journal = wal_path }, .tree);
     defer ds.deinit();
 
     if (ds.statementCount() == 0) {
