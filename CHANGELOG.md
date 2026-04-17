@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/bxrne/derive/compare/v1.0.1...v1.0.2) (2026-04-17)
+
+
+### Bug Fixes
+
+* removed duplicate code via shared handlers, replaced stack based ([6927af4](https://github.com/bxrne/derive/commit/6927af4224e087ab469dea4e3acd88168700d4c4))
+
 ## [1.0.1](https://github.com/bxrne/derive/compare/v1.0.0...v1.0.1) (2026-04-16)
 
 
