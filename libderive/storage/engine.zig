@@ -201,16 +201,13 @@ test "tombstone reuses slot index on reinsert" {
 }
 
 test "core init and deinit" {
-    var engine_core = try Core.init(testing.allocator);
+    var engine_core = try Core.init(testing.allocator, .contiguous);
     defer engine_core.deinit();
-
     try testing.expectEqual(@as(usize, 0), engine_core.store.len());
 }
 
 test "engine core accessor" {
-    var engine = Engine{ .memory = try Core.init(testing.allocator) };
+    var engine = Engine{ .memory = try Core.init(testing.allocator, .contiguous) };
     defer engine.deinit();
-
-    const c = engine.core();
-    try testing.expectEqual(@as(usize, 0), c.store.len());
+    try testing.expectEqual(@as(usize, 0), engine.core().store.len());
 }

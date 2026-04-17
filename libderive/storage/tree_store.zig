@@ -117,20 +117,31 @@ pub const TreeStore = struct {
     pub fn scan(self: *const TreeStore, prefix: []const u32) Iterator {
         std.debug.assert(prefix.len > 0);
         std.debug.assert(prefix.len <= 4);
-        const low_key = prefixLowKey(prefix);
-        const lower = self.lowerBoundNode(low_key);
-        return .{ .current = lower, .prefix = prefixArray(prefix), .prefix_length = @intCast(prefix.len) };
+        const padded = padPrefix(prefix);
+        return .{
+            .current = self.lowerBoundNode(padded),
+            .prefix = padded,
+            .prefix_length = @intCast(prefix.len),
+        };
     }
 
+    /// Destroy every node without allocating. Walks the tree pointer-by-pointer
+    /// using the parent links so teardown cannot itself OOM.
     pub fn clear(self: *TreeStore) void {
-        var stack = std.ArrayListUnmanaged(*Node).empty;
-        defer stack.deinit(self.allocator);
-        if (self.root) |root| stack.append(self.allocator, root) catch return;
-        while (stack.items.len > 0) {
-            const node = stack.pop().?;
-            if (node.left) |left| stack.append(self.allocator, left) catch {};
-            if (node.right) |right| stack.append(self.allocator, right) catch {};
-            self.allocator.destroy(node);
+        var current = self.root;
+        while (current) |node| {
+            if (node.left) |left| {
+                current = left;
+            } else if (node.right) |right| {
+                current = right;
+            } else {
+                const parent = node.parent;
+                if (parent) |p| {
+                    if (p.left == node) p.left = null else p.right = null;
+                }
+                self.allocator.destroy(node);
+                current = parent;
+            }
         }
         self.root = null;
         self.key_count = 0;
@@ -233,23 +244,15 @@ pub const TreeStore = struct {
     }
 };
 
-fn prefixArray(prefix: []const u32) [4]u32 {
-    var out: [4]u32 = .{ 0, 0, 0, 0 };
-    for (prefix, 0..) |value, i| {
-        out[i] = value;
-    }
+/// Copy a (≤4)-element prefix into a zero-padded fixed-size key.
+fn padPrefix(prefix: []const u32) Key {
+    std.debug.assert(prefix.len <= 4);
+    var out: Key = .{ 0, 0, 0, 0 };
+    @memcpy(out[0..prefix.len], prefix);
     return out;
 }
 
-fn prefixLowKey(prefix: []const u32) Key {
-    var out: [4]u32 = .{ 0, 0, 0, 0 };
-    for (prefix, 0..) |value, i| {
-        out[i] = value;
-    }
-    return out;
-}
-
-fn matchesPrefix(key: Key, prefix: [4]u32, prefix_length: u8) bool {
+fn matchesPrefix(key: Key, prefix: Key, prefix_length: u8) bool {
     return prefixOrder(key, prefix[0..prefix_length]) == .eq;
 }
 

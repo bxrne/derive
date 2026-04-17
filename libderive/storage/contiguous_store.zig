@@ -53,13 +53,7 @@ pub const ContiguousStore = struct {
     pub fn insert(self: *ContiguousStore, key: Key) Allocator.Error!void {
         const position = lowerBound(self.items.items, &key);
         if (position < self.items.items.len and compareKeys(self.items.items[position], key) == .eq) return;
-
-        try self.items.append(self.allocator, key);
-        var i: usize = self.items.items.len - 1;
-        while (i > position) : (i -= 1) {
-            self.items.items[i] = self.items.items[i - 1];
-        }
-        self.items.items[position] = key;
+        try self.items.insert(self.allocator, position, key);
     }
 
     /// Return true when the store contains the exact key.

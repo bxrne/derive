@@ -119,7 +119,33 @@ fn encodeQuadPayload(gpa: Allocator, buf: *std.ArrayList(u8), pool: *const Strin
     try writeStr(gpa, buf, pool.get(quad.graph));
 }
 
-/// Append a quad record to the WAL.
+/// Append a framed record: `[kind][u32 LE length][payload][u32 LE crc]`.
+/// The running CRC32 covers kind, length, and payload but excludes the trailing
+/// checksum bytes themselves.
+fn appendRecord(io: Io, file: *File, kind: RecordKind, payload: []const u8, crc: *std.hash.Crc32) WalError!void {
+    if (payload.len > std.math.maxInt(u32)) return error.OutOfMemory;
+
+    var header: [5]u8 = undefined;
+    header[0] = @intFromEnum(kind);
+    std.mem.writeInt(u32, header[1..5], @intCast(payload.len), .little);
+
+    var offset = try file.length(io);
+    try file.writePositionalAll(io, &header, offset);
+    crc.update(&header);
+    offset += header.len;
+
+    if (payload.len > 0) {
+        try file.writePositionalAll(io, payload, offset);
+        crc.update(payload);
+        offset += payload.len;
+    }
+
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
+    try file.writePositionalAll(io, &crc_buf, offset);
+}
+
+/// Append a quad record (add or remove) to the WAL.
 pub fn appendQuadRecord(
     io: Io,
     file: *File,
@@ -132,38 +158,12 @@ pub fn appendQuadRecord(
 ) WalError!void {
     scratch.clearRetainingCapacity();
     try encodeQuadPayload(gpa, scratch, pool, quad);
-    var off = try file.length(io);
-    const kind_byte = @intFromEnum(kind);
-    try file.writePositionalAll(io, &.{kind_byte}, off);
-    crc.update(&.{kind_byte});
-    off += 1;
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(scratch.items.len), .little);
-    try file.writePositionalAll(io, &len_buf, off);
-    crc.update(&len_buf);
-    off += 4;
-    try file.writePositionalAll(io, scratch.items, off);
-    crc.update(scratch.items);
-    off += scratch.items.len;
-    var crc_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
-    try file.writePositionalAll(io, &crc_buf, off);
+    try appendRecord(io, file, kind, scratch.items, crc);
 }
 
-/// Append a commit record to the WAL.
+/// Append a commit record (empty payload) to the WAL.
 pub fn appendCommit(io: Io, file: *File, crc: *std.hash.Crc32) WalError!void {
-    var off = try file.length(io);
-    const kind_byte = @intFromEnum(RecordKind.commit);
-    try file.writePositionalAll(io, &.{kind_byte}, off);
-    crc.update(&.{kind_byte});
-    off += 1;
-    const zero: [4]u8 = .{ 0, 0, 0, 0 };
-    try file.writePositionalAll(io, &zero, off);
-    crc.update(&zero);
-    off += 4;
-    var crc_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
-    try file.writePositionalAll(io, &crc_buf, off);
+    try appendRecord(io, file, .commit, &.{}, crc);
 }
 
 /// Sync the file to disk.

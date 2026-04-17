@@ -30,10 +30,7 @@ pub const KeyScan = union(enum) {
 };
 
 /// Supported index store backings.
-pub const IndexBacking = enum {
-    contiguous,
-    tree,
-};
+pub const IndexBacking = enum { contiguous, tree };
 
 /// The six quad-component orderings used for index permutations.
 pub const Permutation = enum {
@@ -67,18 +64,16 @@ pub const Index = struct {
     };
 
     pub fn init(allocator: Allocator, index_backing: IndexBacking) Index {
-        return .{ .stores = switch (index_backing) {
-            .contiguous => blk: {
-                var stores: [6]ContiguousStore = undefined;
-                for (&stores) |*store| store.* = ContiguousStore.init(allocator);
-                break :blk .{ .contiguous = stores };
-            },
-            .tree => blk: {
-                var stores: [6]TreeStore = undefined;
-                for (&stores) |*store| store.* = TreeStore.init(allocator);
-                break :blk .{ .tree = stores };
-            },
-        } };
+        return switch (index_backing) {
+            .contiguous => .{ .stores = .{ .contiguous = initStores(ContiguousStore, allocator) } },
+            .tree => .{ .stores = .{ .tree = initStores(TreeStore, allocator) } },
+        };
+    }
+
+    fn initStores(comptime Store: type, allocator: Allocator) [6]Store {
+        var stores: [6]Store = undefined;
+        for (&stores) |*store| store.* = Store.init(allocator);
+        return stores;
     }
 
     pub fn backing(self: *const Index) IndexBacking {
@@ -87,36 +82,24 @@ pub const Index = struct {
 
     pub fn deinit(self: *Index) void {
         switch (self.stores) {
-            .contiguous => |*stores| for (stores) |*store| store.deinit(),
-            .tree => |*stores| for (stores) |*store| store.deinit(),
+            inline else => |*stores| for (stores) |*store| store.deinit(),
         }
     }
 
     /// Insert a quad into every permutation index.
     pub fn add(self: *Index, subject: u32, predicate: u32, object: u32, graph: u32) Allocator.Error!void {
         switch (self.stores) {
-            .contiguous => |*stores| {
-                inline for (std.meta.tags(Permutation), stores) |permutation, *store| {
-                    try store.insert(permutation.encode(subject, predicate, object, graph));
-                }
-            },
-            .tree => |*stores| {
-                inline for (std.meta.tags(Permutation), stores) |permutation, *store| {
-                    try store.insert(permutation.encode(subject, predicate, object, graph));
-                }
+            inline else => |*stores| inline for (std.meta.tags(Permutation), stores) |permutation, *store| {
+                try store.insert(permutation.encode(subject, predicate, object, graph));
             },
         }
     }
 
     /// Return true when the exact quad is present.
     pub fn containsQuad(self: *const Index, subject: u32, predicate: u32, object: u32, graph: u32) bool {
+        const key = Permutation.spog.encode(subject, predicate, object, graph);
         return switch (self.stores) {
-            .contiguous => |stores| stores[@intFromEnum(Permutation.spog)].contains(
-                Permutation.spog.encode(subject, predicate, object, graph),
-            ),
-            .tree => |stores| stores[@intFromEnum(Permutation.spog)].contains(
-                Permutation.spog.encode(subject, predicate, object, graph),
-            ),
+            inline else => |stores| stores[@intFromEnum(Permutation.spog)].contains(key),
         };
     }
 
@@ -130,15 +113,8 @@ pub const Index = struct {
     /// Remove a quad from every permutation index.
     pub fn remove(self: *Index, subject: u32, predicate: u32, object: u32, graph: u32) void {
         switch (self.stores) {
-            .contiguous => |*stores| {
-                inline for (std.meta.tags(Permutation), stores) |permutation, *store| {
-                    _ = store.remove(permutation.encode(subject, predicate, object, graph));
-                }
-            },
-            .tree => |*stores| {
-                inline for (std.meta.tags(Permutation), stores) |permutation, *store| {
-                    _ = store.remove(permutation.encode(subject, predicate, object, graph));
-                }
+            inline else => |*stores| inline for (std.meta.tags(Permutation), stores) |permutation, *store| {
+                _ = store.remove(permutation.encode(subject, predicate, object, graph));
             },
         }
     }
@@ -154,8 +130,7 @@ pub const Index = struct {
     /// Clear every permutation index.
     pub fn clear(self: *Index) void {
         switch (self.stores) {
-            .contiguous => |*stores| for (stores) |*store| store.clear(),
-            .tree => |*stores| for (stores) |*store| store.clear(),
+            inline else => |*stores| for (stores) |*store| store.clear(),
         }
     }
 };
@@ -195,11 +170,8 @@ test "prefix scan" {
     try store.insert(.{ 1, 20, 200, 0 });
     try store.insert(.{ 2, 10, 100, 0 });
 
-    const one_prefix = store.scan(&.{1});
-    try testing.expectEqual(@as(usize, 2), one_prefix.len);
-
-    const exact = store.scan(&.{ 1, 10 });
-    try testing.expectEqual(@as(usize, 1), exact.len);
+    try testing.expectEqual(@as(usize, 2), store.scan(&.{1}).len);
+    try testing.expectEqual(@as(usize, 1), store.scan(&.{ 1, 10 }).len);
 }
 
 test "remove" {
@@ -252,11 +224,10 @@ test "prefix scan by graph" {
     try index.add(4, 5, 6, 10);
     try index.add(7, 8, 9, 20);
 
-    var scan_result = index.scan(.gspo, &.{10});
-    try testing.expectEqual(@as(usize, 2), scanCount(&scan_result));
-
-    var scan_other = index.scan(.gspo, &.{20});
-    try testing.expectEqual(@as(usize, 1), scanCount(&scan_other));
+    var scan_ten = index.scan(.gspo, &.{10});
+    try testing.expectEqual(@as(usize, 2), scanCount(&scan_ten));
+    var scan_twenty = index.scan(.gspo, &.{20});
+    try testing.expectEqual(@as(usize, 1), scanCount(&scan_twenty));
 }
 
 test "prefix scan by predicate and object" {
@@ -313,8 +284,6 @@ test "tree backing preserves prefix order" {
 
 fn scanCount(scan: *KeyScan) usize {
     var count: usize = 0;
-    while (scan.next()) |_| {
-        count += 1;
-    }
+    while (scan.next()) |_| count += 1;
     return count;
 }

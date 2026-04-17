@@ -14,17 +14,20 @@ const Engine = storage.Engine;
 const Core = storage.Core;
 const spogKeyFromQuad = storage.spogKeyFromQuad;
 const LiveQuadIterator = storage.LiveQuadIterator;
+const StringPool = storage.StringPool;
 
 const query = @import("query.zig");
 const wal = storage;
 
 pub const AddStatementError = Allocator.Error || rdf.StatementBoundaryError || wal.WalError;
-
 pub const OpenError = Allocator.Error || wal.WalError || AddStatementError || Io.File.OpenError;
 
 pub const WalMode = wal.WalMode;
 pub const WalBundle = wal.WalBundle;
 pub const IndexBacking = @import("index.zig").IndexBacking;
+
+/// Checksum seed written into the WAL header of new journals.
+const wal_header_seed: u32 = 0x12345678;
 
 pub const RDFDataset = struct {
     engine: Engine,
@@ -48,40 +51,34 @@ pub const RDFDataset = struct {
         };
         errdefer dataset.deinit();
 
-        switch (mode) {
-            .memory => {},
-            .journal => |wal_path| {
-                var file = Io.Dir.cwd().openFile(io, wal_path, .{ .mode = .read_write }) catch |err| switch (err) {
-                    error.FileNotFound => try Io.Dir.cwd().createFile(io, wal_path, .{ .read = true }),
-                    else => return err,
-                };
+        const journal_path = switch (mode) {
+            .memory => return dataset,
+            .journal => |path| path,
+        };
 
-                var seed: u32 = 0x12345678; // Hardcoded or random seed
-                const stat = try file.stat(io);
-                if (stat.size == 0) {
-                    try wal.writeHeader(io, &file, seed);
-                } else {
-                    var read_buffer: [4096]u8 = undefined;
-                    var file_reader = file.reader(io, &read_buffer);
-                    seed = try wal.readAndVerifyHeader(&file_reader.interface);
-                    try dataset.replayWalRecords(allocator, &file_reader.interface, seed, &file, io);
-                }
+        var file = Io.Dir.cwd().openFile(io, journal_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => try Io.Dir.cwd().createFile(io, journal_path, .{ .read = true }),
+            else => return err,
+        };
 
-                var crc = std.hash.Crc32.init();
-                // We re-seed the checksum to match the one on disk.
-                // However, Crc32 doesn't let us seed cleanly, so we just hash the seed initially.
-                var seed_buf: [4]u8 = undefined;
-                std.mem.writeInt(u32, &seed_buf, seed, .little);
-                crc.update(&seed_buf);
+        const stat = try file.stat(io);
+        const seed: u32 = if (stat.size == 0) blk: {
+            try wal.writeHeader(io, &file, wal_header_seed);
+            break :blk wal_header_seed;
+        } else blk: {
+            var read_buffer: [4096]u8 = undefined;
+            var file_reader = file.reader(io, &read_buffer);
+            const header_seed = try wal.readAndVerifyHeader(&file_reader.interface);
+            try dataset.replayWalRecords(allocator, &file_reader.interface, header_seed, &file, io);
+            break :blk header_seed;
+        };
 
-                dataset.wal_bundle = .{
-                    .io = io,
-                    .file = file,
-                    .scratch = .empty,
-                    .crc = crc,
-                };
-            },
-        }
+        var crc = std.hash.Crc32.init();
+        var seed_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seed_buf, seed, .little);
+        crc.update(&seed_buf);
+
+        dataset.wal_bundle = .{ .io = io, .file = file, .scratch = .empty, .crc = crc };
         return dataset;
     }
 
@@ -107,26 +104,7 @@ pub const RDFDataset = struct {
     }
 
     fn replayWalRecords(self: *RDFDataset, allocator: Allocator, reader: *Io.Reader, seed: u32, file: *Io.File, io: Io) OpenError!void {
-        try wal.replay(
-            AddStatementError,
-            AddStatementError,
-            allocator,
-            reader,
-            seed,
-            file,
-            io,
-            self,
-            replayAddQuad,
-            replayRemoveQuad,
-        );
-    }
-
-    fn replayAddQuad(self: *RDFDataset, subject: Input, predicate: []const u8, object: Input, graph: []const u8) AddStatementError!void {
-        try self.addQuad(subject, predicate, object, graph);
-    }
-
-    fn replayRemoveQuad(self: *RDFDataset, subject: Input, predicate: []const u8, object: Input, graph: []const u8) AddStatementError!void {
-        try self.removeQuad(subject, predicate, object, graph);
+        try wal.replay(AddStatementError, AddStatementError, allocator, reader, seed, file, io, self, addQuad, removeQuad);
     }
 
     pub fn statementCount(self: *const RDFDataset) usize {
@@ -150,9 +128,8 @@ pub const RDFDataset = struct {
         try rdf.validateObjectInput(object_input);
         if (!rdf.isValidNamedGraphName(graph_name)) return error.InvalidGraphName;
 
-        const subject = try rdf.internTerm(&c.strings, subject_input);
         const quad: Quad = .{
-            .subject = subject,
+            .subject = try rdf.internTerm(&c.strings, subject_input),
             .predicate = try c.strings.intern(predicate_iri),
             .object = try rdf.internTerm(&c.strings, object_input),
             .graph = try c.strings.intern(graph_name),
@@ -185,16 +162,15 @@ pub const RDFDataset = struct {
     /// Resolved subject string for logging or display.
     pub fn subjectLabel(self: *const RDFDataset, quad: Quad) []const u8 {
         return switch (quad.subject) {
-            .iri => |handle| self.resolve(handle),
-            .blank_node => |handle| self.resolve(handle),
+            .iri, .blank_node => |handle| self.resolve(handle),
             .literal => "(literal)",
         };
     }
 
     pub fn match(self: *const RDFDataset, pattern: Pattern) MatchIterator {
         const c = self.engine.coreConst();
-        const bound = query.bindHandles(&c.strings, pattern) orelse return query.unmatchable(&c.store);
-        return query.build(&c.store, &c.index, bound);
+        const bindings = query.bindHandles(&c.strings, pattern) orelse return query.unmatchable(&c.store);
+        return query.build(&c.store, &c.index, bindings);
     }
 
     pub fn removeTriple(self: *RDFDataset, subject: Input, predicate: []const u8, object: Input) AddStatementError!void {
@@ -203,11 +179,7 @@ pub const RDFDataset = struct {
 
     pub fn removeQuad(self: *RDFDataset, subject_input: Input, predicate_iri: []const u8, object_input: Input, graph_name: []const u8) AddStatementError!void {
         const c = self.engine.core();
-        const subject_key = rdf.findTermKey(&c.strings, subject_input) orelse return;
-        const predicate_key = if (c.strings.find(predicate_iri)) |handle| @intFromEnum(handle) else return;
-        const object_key = rdf.findTermKey(&c.strings, object_input) orelse return;
-        const graph_key = if (c.strings.find(graph_name)) |handle| @intFromEnum(handle) else return;
-        const key: [4]u32 = .{ subject_key, predicate_key, object_key, graph_key };
+        const key = resolveSpogKey(&c.strings, subject_input, predicate_iri, object_input, graph_name) orelse return;
         if (!c.store.containsSpogKey(key)) return;
         const quad = c.store.quadCopyForSpogKey(key) orelse return;
 
@@ -216,9 +188,25 @@ pub const RDFDataset = struct {
         }
 
         try c.store.removeBySpogKey(c.strings.allocator, key);
-        c.index.remove(subject_key, predicate_key, object_key, graph_key);
+        c.index.remove(key[0], key[1], key[2], key[3]);
     }
 };
+
+/// Resolve an API-level quad description to its raw SPOG key, or null when
+/// any component is absent from the string pool (so the quad cannot exist).
+fn resolveSpogKey(
+    pool: *const StringPool,
+    subject_input: rdf.Input,
+    predicate_iri: []const u8,
+    object_input: rdf.Input,
+    graph_name: []const u8,
+) ?[4]u32 {
+    const subject = rdf.findTermKey(pool, subject_input) orelse return null;
+    const predicate = if (pool.find(predicate_iri)) |h| @intFromEnum(h) else return null;
+    const object = rdf.findTermKey(pool, object_input) orelse return null;
+    const graph = if (pool.find(graph_name)) |h| @intFromEnum(h) else return null;
+    return .{ subject, predicate, object, graph };
+}
 
 const testing = std.testing;
 
@@ -241,10 +229,7 @@ const TestHarness = struct {
 
     fn processInit(self: *TestHarness) std.process.Init {
         return .{
-            .minimal = .{
-                .environ = .empty,
-                .args = .{ .vector = &.{} },
-            },
+            .minimal = .{ .environ = .empty, .args = .{ .vector = &.{} } },
             .arena = &self.arena,
             .gpa = testing.allocator,
             .io = testing.io,
@@ -252,128 +237,137 @@ const TestHarness = struct {
             .preopens = .empty,
         };
     }
+
+    fn openMemory(self: *TestHarness) !RDFDataset {
+        return RDFDataset.init(self.processInit(), .memory, .contiguous);
+    }
 };
+
+const ex_a = "http://example.org/a";
+const ex_b = "http://example.org/b";
+const ex_p = "http://example.org/p";
+const ex_alice = "http://example.org/alice";
+const ex_bob = "http://example.org/bob";
+const ex_knows = "http://example.org/knows";
 
 test "add triples and quads" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    const alice = "http://example.org/alice";
-    const knows = "http://example.org/knows";
-    const bob = "http://example.org/bob";
-    try dataset.addTriple(.{ .iri = alice }, knows, .{ .iri = bob });
-    try dataset.addQuad(.{ .iri = alice }, knows, .{ .iri = bob }, "http://example.org/graph");
+    try dataset.addTriple(.{ .iri = ex_alice }, ex_knows, .{ .iri = ex_bob });
+    try dataset.addQuad(.{ .iri = ex_alice }, ex_knows, .{ .iri = ex_bob }, "http://example.org/graph");
     var iterator = dataset.iterStatements();
     const first = iterator.next().?;
-    try testing.expectEqualStrings(alice, dataset.resolve(first.subject.iri));
-    try testing.expectEqualStrings(knows, dataset.resolve(first.predicate));
-    try testing.expectEqualStrings(bob, dataset.resolve(first.object.iri));
+    try testing.expectEqualStrings(ex_alice, dataset.resolve(first.subject.iri));
+    try testing.expectEqualStrings(ex_knows, dataset.resolve(first.predicate));
+    try testing.expectEqualStrings(ex_bob, dataset.resolve(first.object.iri));
     try testing.expectEqualStrings(rdf.default_graph_iri, dataset.resolve(first.graph));
 }
 
 test "contains without allocating" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try dataset.addTriple(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" });
-    try testing.expect(dataset.contains(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" }));
-    try testing.expect(!dataset.contains(.{ .iri = "http://example.org/x" }, "http://example.org/p", .{ .iri = "http://example.org/b" }));
+    try dataset.addTriple(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b });
+    try testing.expect(dataset.contains(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b }));
+    try testing.expect(!dataset.contains(.{ .iri = "http://example.org/x" }, ex_p, .{ .iri = ex_b }));
 }
 
 test "deduplicates across quads" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try dataset.addTriple(.{ .iri = "http://example.org/alice" }, "http://example.org/knows", .{ .iri = "http://example.org/bob" });
-    try dataset.addTriple(.{ .iri = "http://example.org/alice" }, "http://example.org/knows", .{ .iri = "http://example.org/bob" });
+    try dataset.addTriple(.{ .iri = ex_alice }, ex_knows, .{ .iri = ex_bob });
+    try dataset.addTriple(.{ .iri = ex_alice }, ex_knows, .{ .iri = ex_bob });
     try testing.expectEqual(@as(usize, 1), dataset.statementCount());
-    try testing.expect(dataset.contains(.{ .iri = "http://example.org/alice" }, "http://example.org/knows", .{ .iri = "http://example.org/bob" }));
+    try testing.expect(dataset.contains(.{ .iri = ex_alice }, ex_knows, .{ .iri = ex_bob }));
 }
 
 test "remove quad" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try dataset.addTriple(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" });
+    try dataset.addTriple(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b });
     try testing.expectEqual(@as(usize, 1), dataset.statementCount());
-    try dataset.removeTriple(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" });
+    try dataset.removeTriple(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b });
     try testing.expectEqual(@as(usize, 0), dataset.statementCount());
-    try testing.expect(!dataset.contains(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" }));
+    try testing.expect(!dataset.contains(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b }));
 }
 
 test "rejects literal subject" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try testing.expectError(error.InvalidSubject, dataset.addTriple(.{ .literal = .{ .value = "x" } }, "http://example.org/p", .{ .iri = "http://example.org/o" }));
+    try testing.expectError(error.InvalidSubject, dataset.addTriple(.{ .literal = .{ .value = "x" } }, ex_p, .{ .iri = "http://example.org/o" }));
 }
 
 test "rejects non-iri predicate" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try testing.expectError(error.InvalidPredicateIri, dataset.addTriple(.{ .iri = "http://example.org/a" }, "_:b", .{ .iri = "http://example.org/b" }));
-    try testing.expectError(error.InvalidPredicateIri, dataset.addTriple(.{ .iri = "http://example.org/a" }, "noscheme", .{ .iri = "http://example.org/b" }));
+    try testing.expectError(error.InvalidPredicateIri, dataset.addTriple(.{ .iri = ex_a }, "_:b", .{ .iri = ex_b }));
+    try testing.expectError(error.InvalidPredicateIri, dataset.addTriple(.{ .iri = ex_a }, "noscheme", .{ .iri = ex_b }));
 }
 
 test "accepts blank graph name" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try dataset.addQuad(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" }, "_:g1");
+    try dataset.addQuad(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b }, "_:g1");
     try testing.expectEqual(@as(usize, 1), dataset.statementCount());
 }
 
 test "rejects invalid graph name" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try testing.expectError(error.InvalidGraphName, dataset.addQuad(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" }, "no-scheme"));
+    try testing.expectError(error.InvalidGraphName, dataset.addQuad(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b }, "no-scheme"));
 }
 
 test "rejects invalid subject or object IRI" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try testing.expectError(error.InvalidSubjectIri, dataset.addTriple(.{ .iri = "bad" }, "http://example.org/p", .{ .iri = "http://example.org/o" }));
-    try testing.expectError(error.InvalidObjectIri, dataset.addTriple(.{ .iri = "http://example.org/s" }, "http://example.org/p", .{ .iri = "bad" }));
+    try testing.expectError(error.InvalidSubjectIri, dataset.addTriple(.{ .iri = "bad" }, ex_p, .{ .iri = "http://example.org/o" }));
+    try testing.expectError(error.InvalidObjectIri, dataset.addTriple(.{ .iri = "http://example.org/s" }, ex_p, .{ .iri = "bad" }));
 }
 
 test "rejects empty blank node label" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try testing.expectError(error.InvalidBlankNodeLabel, dataset.addTriple(.{ .blank_node = "" }, "http://example.org/p", .{ .iri = "http://example.org/o" }));
+    try testing.expectError(error.InvalidBlankNodeLabel, dataset.addTriple(.{ .blank_node = "" }, ex_p, .{ .iri = "http://example.org/o" }));
 }
 
 test "rejects invalid literal shape" {
     var harness = TestHarness.init();
     defer harness.deinit();
-    var dataset = try RDFDataset.init(harness.processInit(), .memory);
+    var dataset = try harness.openMemory();
     defer dataset.deinit();
-    try testing.expectError(error.InvalidLiteral, dataset.addTriple(.{ .iri = "http://example.org/s" }, "http://example.org/p", .{
+    const subject: rdf.Input = .{ .iri = "http://example.org/s" };
+    try testing.expectError(error.InvalidLiteral, dataset.addTriple(subject, ex_p, .{ .literal = .{
         .value = "x",
         .lang = "en",
         .datatype = "http://www.w3.org/2001/XMLSchema#string",
-    }));
-    try testing.expectError(error.InvalidLiteral, dataset.addTriple(.{ .iri = "http://example.org/s" }, "http://example.org/p", .{
+    } }));
+    try testing.expectError(error.InvalidLiteral, dataset.addTriple(subject, ex_p, .{ .literal = .{
         .value = "x",
         .datatype = "not-an-iri",
-    }));
-    try testing.expectError(error.InvalidLiteral, dataset.addTriple(.{ .iri = "http://example.org/s" }, "http://example.org/p", .{
+    } }));
+    try testing.expectError(error.InvalidLiteral, dataset.addTriple(subject, ex_p, .{ .literal = .{
         .value = "x",
         .lang = "",
-    }));
+    } }));
 }
 
 test "wal roundtrip replay" {
@@ -382,17 +376,17 @@ test "wal roundtrip replay" {
     {
         var harness = TestHarness.init();
         defer harness.deinit();
-        var dataset = try RDFDataset.init(harness.processInit(), .{ .journal = path });
+        var dataset = try RDFDataset.init(harness.processInit(), .{ .journal = path }, .contiguous);
         defer dataset.deinit();
-        try dataset.addTriple(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" });
+        try dataset.addTriple(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b });
         try dataset.commitWal();
     }
     {
         var harness = TestHarness.init();
         defer harness.deinit();
-        var dataset = try RDFDataset.init(harness.processInit(), .{ .journal = path });
+        var dataset = try RDFDataset.init(harness.processInit(), .{ .journal = path }, .contiguous);
         defer dataset.deinit();
         try testing.expectEqual(@as(usize, 1), dataset.statementCount());
-        try testing.expect(dataset.contains(.{ .iri = "http://example.org/a" }, "http://example.org/p", .{ .iri = "http://example.org/b" }));
+        try testing.expect(dataset.contains(.{ .iri = ex_a }, ex_p, .{ .iri = ex_b }));
     }
 }

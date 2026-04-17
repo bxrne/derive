@@ -7,63 +7,85 @@
 
 const std = @import("std");
 const rdf = @import("rdf.zig");
-const Index = @import("index.zig").Index;
-const KeyScan = @import("index.zig").KeyScan;
-const Permutation = @import("index.zig").Permutation;
+const index_mod = @import("index.zig");
+const Index = index_mod.Index;
+const KeyScan = index_mod.KeyScan;
+const Permutation = index_mod.Permutation;
 const Quad = rdf.Quad;
 const storage = @import("storage/mod.zig");
 const QuadStore = storage.QuadStore;
 const StringPool = storage.StringPool;
 const Pattern = rdf.Pattern;
 
+/// Bindings of a match pattern to string-pool handle keys.
+/// A null component is an unbound wildcard.
+pub const Bindings = struct {
+    subject: ?u32 = null,
+    predicate: ?u32 = null,
+    object: ?u32 = null,
+    graph: ?u32 = null,
+
+    fn isFullyUnbound(self: Bindings) bool {
+        return self.subject == null and self.predicate == null and
+            self.object == null and self.graph == null;
+    }
+
+    /// Map the four SPOG components into the order defined by the permutation.
+    fn componentsFor(self: Bindings, permutation: Permutation) [4]?u32 {
+        return switch (permutation) {
+            .spog => .{ self.subject, self.predicate, self.object, self.graph },
+            .posg => .{ self.predicate, self.object, self.subject, self.graph },
+            .ospg => .{ self.object, self.subject, self.predicate, self.graph },
+            .gspo => .{ self.graph, self.subject, self.predicate, self.object },
+            .gpos => .{ self.graph, self.predicate, self.object, self.subject },
+            .gosp => .{ self.graph, self.object, self.subject, self.predicate },
+        };
+    }
+};
+
 /// Walks quads that match a bound pattern, using either a full slot scan
 /// or a prefix-narrowed key range.
 pub const Iterator = struct {
     store: *const QuadStore,
-    mode: union(enum) {
-        statements: void,
-        keys: struct { permutation: Permutation, scan: KeyScan },
-    },
-    subject: ?u32,
-    predicate: ?u32,
-    object: ?u32,
-    graph: ?u32,
+    mode: Mode,
+    bindings: Bindings,
     position: usize,
+
+    const Mode = union(enum) {
+        statements,
+        keys: struct { permutation: Permutation, scan: KeyScan },
+    };
 
     /// Advance to the next quad matching the bound pattern.
     pub fn next(self: *Iterator) ?Quad {
         switch (self.mode) {
             .statements => {
                 const items = self.store.slotSlice();
-                while (self.position < items.len) {
-                    const index = self.position;
-                    self.position += 1;
-                    if (items[index]) |quad| {
-                        if (matches(self, quad)) return quad;
-                    }
+                while (self.position < items.len) : (self.position += 1) {
+                    if (items[self.position]) |quad| if (self.matches(quad)) {
+                        self.position += 1;
+                        return quad;
+                    };
                 }
                 return null;
             },
-            .keys => |*mode| {
-                while (mode.scan.next()) |key| {
-                    const spog_key = decodeToSpog(mode.permutation, key);
-                    const quad = self.store.quadCopyForSpogKey(spog_key) orelse continue;
-                    if (matches(self, quad)) return quad;
-                }
-                return null;
+            .keys => |*key_mode| while (key_mode.scan.next()) |key| {
+                const spog = decodeToSpog(key_mode.permutation, key);
+                const quad = self.store.quadCopyForSpogKey(spog) orelse continue;
+                if (self.matches(quad)) return quad;
             },
         }
+        return null;
+    }
+
+    fn matches(self: *const Iterator, quad: Quad) bool {
+        if (self.bindings.subject) |s| if (quad.subject.key() != s) return false;
+        if (self.bindings.predicate) |p| if (@intFromEnum(quad.predicate) != p) return false;
+        if (self.bindings.object) |o| if (quad.object.key() != o) return false;
+        if (self.bindings.graph) |g| if (@intFromEnum(quad.graph) != g) return false;
+        return true;
     }
 };
-
-/// Check whether a quad satisfies all bound filter components.
-fn matches(filters: *const Iterator, quad: Quad) bool {
-    if (filters.subject) |subject| if (quad.subject.key() != subject) return false;
-    if (filters.predicate) |predicate| if (@intFromEnum(quad.predicate) != predicate) return false;
-    if (filters.object) |object| if (quad.object.key() != object) return false;
-    if (filters.graph) |graph| if (@intFromEnum(quad.graph) != graph) return false;
-    return true;
-}
 
 /// Translate a permutation-ordered key back to subject-predicate-object-graph order.
 fn decodeToSpog(permutation: Permutation, key: [4]u32) [4]u32 {
@@ -77,22 +99,20 @@ fn decodeToSpog(permutation: Permutation, key: [4]u32) [4]u32 {
     };
 }
 
-/// Handle keys resolved from a `Pattern` via the string pool.
-pub const BoundHandles = struct {
-    subject: ?u32,
-    predicate: ?u32,
-    object: ?u32,
-    graph: ?u32,
-};
+/// Resolve a string through the pool to its raw `u32` handle key.
+fn findKey(pool: *const StringPool, name: []const u8) ?u32 {
+    return if (pool.find(name)) |h| @intFromEnum(h) else null;
+}
 
-/// Resolve a pattern to bound handle keys via the string pool. Returns null
-/// if any specified term does not exist in the pool.
-pub fn bindHandles(pool: *const StringPool, pattern: Pattern) ?BoundHandles {
-    const subject: ?u32 = if (pattern.s) |value| rdf.findTermKey(pool, value) orelse return null else null;
-    const predicate: ?u32 = if (pattern.p) |value| if (pool.find(value)) |handle| @intFromEnum(handle) else return null else null;
-    const object: ?u32 = if (pattern.o) |value| rdf.findTermKey(pool, value) orelse return null else null;
-    const graph: ?u32 = if (pattern.g) |value| if (pool.find(value)) |handle| @intFromEnum(handle) else return null else null;
-    return .{ .subject = subject, .predicate = predicate, .object = object, .graph = graph };
+/// Resolve a pattern to handle keys via the string pool. Returns null if
+/// any specified term does not exist in the pool.
+pub fn bindHandles(pool: *const StringPool, pattern: Pattern) ?Bindings {
+    var bindings: Bindings = .{};
+    if (pattern.s) |value| bindings.subject = rdf.findTermKey(pool, value) orelse return null;
+    if (pattern.p) |value| bindings.predicate = findKey(pool, value) orelse return null;
+    if (pattern.o) |value| bindings.object = rdf.findTermKey(pool, value) orelse return null;
+    if (pattern.g) |value| bindings.graph = findKey(pool, value) orelse return null;
+    return bindings;
 }
 
 const ScanPlan = struct {
@@ -101,108 +121,55 @@ const ScanPlan = struct {
     prefix_length: u8,
 };
 
-/// Select the permutation whose longest prefix covers the most bound components.
-fn chooseScanPlan(subject: ?u32, predicate: ?u32, object: ?u32, graph: ?u32) ScanPlan {
-    const Candidate = struct { permutation: Permutation, prefix_length: u8 };
-    const candidates = [_]Candidate{
-        .{ .permutation = .gspo, .prefix_length = prefixLength(.gspo, subject, predicate, object, graph) },
-        .{ .permutation = .gpos, .prefix_length = prefixLength(.gpos, subject, predicate, object, graph) },
-        .{ .permutation = .gosp, .prefix_length = prefixLength(.gosp, subject, predicate, object, graph) },
-        .{ .permutation = .spog, .prefix_length = prefixLength(.spog, subject, predicate, object, graph) },
-        .{ .permutation = .posg, .prefix_length = prefixLength(.posg, subject, predicate, object, graph) },
-        .{ .permutation = .ospg, .prefix_length = prefixLength(.ospg, subject, predicate, object, graph) },
-    };
-    var best = candidates[0];
-    for (candidates[1..]) |candidate| {
-        if (candidate.prefix_length > best.prefix_length) best = candidate;
+/// Select the permutation whose longest prefix covers the most bound
+/// components. Ties break in the `Permutation` declaration order.
+fn chooseScanPlan(bindings: Bindings) ScanPlan {
+    const tie_break_order = [_]Permutation{ .gspo, .gpos, .gosp, .spog, .posg, .ospg };
+
+    var best_permutation: Permutation = tie_break_order[0];
+    var best_length: u8 = 0;
+    var best_components: [4]?u32 = bindings.componentsFor(best_permutation);
+
+    for (tie_break_order) |permutation| {
+        const components = bindings.componentsFor(permutation);
+        var length: u8 = 0;
+        for (components) |component| {
+            if (component == null) break;
+            length += 1;
+        }
+        if (length > best_length) {
+            best_length = length;
+            best_permutation = permutation;
+            best_components = components;
+        }
     }
-    return .{
-        .permutation = best.permutation,
-        .prefix = buildPrefix(best.permutation, best.prefix_length, subject, predicate, object, graph),
-        .prefix_length = best.prefix_length,
-    };
-}
 
-/// Count how many leading components of the permutation are bound.
-fn prefixLength(permutation: Permutation, subject: ?u32, predicate: ?u32, object: ?u32, graph: ?u32) u8 {
-    const components = permutationComponents(permutation, subject, predicate, object, graph);
-    var length: u8 = 0;
-    inline for (components) |component| {
-        if (component == null) break;
-        length += 1;
-    }
-    return length;
-}
-
-/// Map the four SPOG components into the order defined by the given permutation.
-fn permutationComponents(permutation: Permutation, subject: ?u32, predicate: ?u32, object: ?u32, graph: ?u32) [4]?u32 {
-    return switch (permutation) {
-        .spog => .{ subject, predicate, object, graph },
-        .posg => .{ predicate, object, subject, graph },
-        .ospg => .{ object, subject, predicate, graph },
-        .gspo => .{ graph, subject, predicate, object },
-        .gpos => .{ graph, predicate, object, subject },
-        .gosp => .{ graph, object, subject, predicate },
-    };
-}
-
-/// Build a fixed-size prefix array from the bound components in permutation order.
-fn buildPrefix(permutation: Permutation, prefix_length: u8, subject: ?u32, predicate: ?u32, object: ?u32, graph: ?u32) [4]u32 {
-    std.debug.assert(prefix_length <= 4);
-    const components = permutationComponents(permutation, subject, predicate, object, graph);
-    var out: [4]u32 = .{ 0, 0, 0, 0 };
-    if (prefix_length >= 1) out[0] = components[0].?;
-    if (prefix_length >= 2) out[1] = components[1].?;
-    if (prefix_length >= 3) out[2] = components[2].?;
-    if (prefix_length >= 4) out[3] = components[3].?;
-    return out;
-}
-
-/// Create a statement-scan iterator starting at the given position.
-fn statementScan(
-    store: *const QuadStore,
-    position: usize,
-    subject: ?u32,
-    predicate: ?u32,
-    object: ?u32,
-    graph: ?u32,
-) Iterator {
-    return .{
-        .store = store,
-        .mode = .statements,
-        .subject = subject,
-        .predicate = predicate,
-        .object = object,
-        .graph = graph,
-        .position = position,
-    };
+    var prefix: [4]u32 = .{ 0, 0, 0, 0 };
+    for (best_components[0..best_length], 0..) |component, i| prefix[i] = component.?;
+    return .{ .permutation = best_permutation, .prefix = prefix, .prefix_length = best_length };
 }
 
 /// Return an iterator that yields no results.
 pub fn unmatchable(store: *const QuadStore) Iterator {
-    return statementScan(store, store.physicalSlotCount(), null, null, null, null);
+    return .{
+        .store = store,
+        .mode = .statements,
+        .bindings = .{},
+        .position = store.physicalSlotCount(),
+    };
 }
 
 /// Build an iterator for the given bound handles, choosing the best scan plan.
-pub fn build(store: *const QuadStore, index: *const Index, bound: BoundHandles) Iterator {
-    const subject = bound.subject;
-    const predicate = bound.predicate;
-    const object = bound.object;
-    const graph = bound.graph;
-
-    if (subject == null and predicate == null and object == null and graph == null) {
-        return statementScan(store, 0, null, null, null, null);
+pub fn build(store: *const QuadStore, index: *const Index, bindings: Bindings) Iterator {
+    if (bindings.isFullyUnbound()) {
+        return .{ .store = store, .mode = .statements, .bindings = bindings, .position = 0 };
     }
-
-    const plan = chooseScanPlan(subject, predicate, object, graph);
+    const plan = chooseScanPlan(bindings);
     const keys = index.scan(plan.permutation, plan.prefix[0..plan.prefix_length]);
     return .{
         .store = store,
         .mode = .{ .keys = .{ .permutation = plan.permutation, .scan = keys } },
-        .subject = subject,
-        .predicate = predicate,
-        .object = object,
-        .graph = graph,
+        .bindings = bindings,
         .position = 0,
     };
 }
