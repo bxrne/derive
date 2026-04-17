@@ -13,11 +13,13 @@ Durability is optional: keep everything in memory, or enable an append-only **jo
 ## Quick start
 
 ```sh
-zig build          # compile and install demo binaries
-zig build test     # run all tests
-zig build demo-contiguous   # build and run the contiguous demo (journal: derive-demo.wal in cwd)
-zig build demo-tree         # build and run the treap demo (journal: derive-tree-demo.wal in cwd)
+zig build                    # compile and install demo binaries (use -Doptimize=ReleaseFast for realistic demo timings)
+zig build test               # run all tests
+zig build demo-contiguous    # LUBM benchmark on the contiguous index; untimed WAL roundtrip at derive-demo.wal
+zig build demo-tree          # LUBM benchmark on the treap index; untimed WAL roundtrip at derive-tree-demo.wal
 ```
+
+Each demo loads a LUBM-shaped dataset (universities, departments, faculty, students, courses, publications) at 100 000 and 1 000 000 quads, runs the canonical basic-graph-pattern query suite, and prints per-query timings as `k=v` log lines. After the timed section the demo performs a separate, untimed WAL write/replay roundtrip to exercise durability.
 
 ## Documentation
 
@@ -29,7 +31,7 @@ zig build demo-tree         # build and run the treap demo (journal: derive-tree
 The documentation is generated via the Zig build system and is available as a html site with a WASM search index. To generate the documentation, run:
 
 ```sh
-zig build doc
+zig build docs
 
 cd docs/libderive
 uv run python -m http.server 8000
